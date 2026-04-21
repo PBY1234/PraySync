@@ -1,26 +1,150 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
   Animated,
   StyleSheet,
-  ScrollView,
-  Vibration,
   Platform,
 } from 'react-native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
+import {
+  useTrackPlayerEvents,
+  Event as TPEvent,
+} from 'react-native-track-player';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
+
 import { useRosary } from '../hooks/useRosary';
 import BeadProgress from '../components/BeadProgress';
 import MysteryOverlay from '../components/MysteryOverlay';
+import {
+  setupTrackPlayer,
+  teardownTrackPlayer,
+  updateLockScreen,
+  getLockScreenLines,
+} from '../services/trackPlayer';
 import { COLORS, FONTS, SIZES, RADIUS } from '../theme';
 import type { MysterySetId } from '../constants/rosary';
 import type { RootStackParamList } from '../../App';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Pray'>;
+
+// ─── Contenido heroico según tipo de paso ─────────────────────────────────────
+
+function StepHero({
+  step,
+  mysteryTitle,
+  glowAnim,
+}: {
+  step: ReturnType<typeof useRosary>['currentStep'];
+  mysteryTitle: string;
+  glowAnim: Animated.Value;
+}) {
+  if (step.type === 'hail_mary') {
+    const isIntro = step.decade === undefined;
+    const num = step.beadInDecade ?? 1;
+    const total = isIntro ? 3 : 10;
+    return (
+      <View style={hero.container}>
+        <Text style={hero.label}>Avemaría</Text>
+        <View style={hero.countRow}>
+          <Text style={hero.countBig}>{num}</Text>
+          <Text style={hero.countSep}>/</Text>
+          <Text style={hero.countTotal}>{total}</Text>
+        </View>
+        {isIntro && (
+          <Text style={hero.sub}>
+            {num === 1 ? 'por la Fe' : num === 2 ? 'por la Esperanza' : 'por la Caridad'}
+          </Text>
+        )}
+      </View>
+    );
+  }
+
+  if (step.type === 'our_father') {
+    return (
+      <View style={hero.container}>
+        <Text style={hero.prayerName}>Padre{'\n'}Nuestro</Text>
+        {mysteryTitle ? <Text style={hero.sub}>{mysteryTitle}</Text> : null}
+      </View>
+    );
+  }
+
+  if (step.type === 'glory_be') {
+    return (
+      <Animated.View
+        style={[
+          hero.container,
+          {
+            opacity: glowAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 0.85] }),
+          },
+        ]}
+      >
+        <Animated.Text
+          style={[
+            hero.gloryText,
+            {
+              transform: [
+                {
+                  scale: glowAnim.interpolate({
+                    inputRange: [0, 1],
+                    outputRange: [1, 1.06],
+                  }),
+                },
+              ],
+            },
+          ]}
+        >
+          Gloria
+        </Animated.Text>
+        {step.decade !== undefined && (
+          <Text style={hero.gloryDecade}>{step.decade}° decenio completado</Text>
+        )}
+      </Animated.View>
+    );
+  }
+
+  if (step.type === 'sign_of_cross' || step.type === 'sign_of_cross_final') {
+    return (
+      <View style={hero.container}>
+        <Text style={hero.symbol}>✝</Text>
+        <Text style={hero.label}>Señal de la Cruz</Text>
+      </View>
+    );
+  }
+
+  if (step.type === 'fatima') {
+    return (
+      <View style={hero.container}>
+        <Text style={hero.prayerName}>Jaculatoria{'\n'}de Fátima</Text>
+      </View>
+    );
+  }
+
+  if (step.type === 'salve') {
+    return (
+      <View style={hero.container}>
+        <Text style={hero.prayerName}>Salve{'\n'}Regina</Text>
+      </View>
+    );
+  }
+
+  // creed, closing, mystery_announce
+  const labels: Record<string, string> = {
+    creed: 'Credo',
+    closing: 'Oración\nFinal',
+    mystery_announce: '…',
+  };
+  return (
+    <View style={hero.container}>
+      <Text style={hero.prayerName}>{labels[step.type] ?? step.type}</Text>
+    </View>
+  );
+}
+
+// ─── Pantalla principal ────────────────────────────────────────────────────────
 
 export default function PrayScreen({ route, navigation }: Props) {
   const mysterySetId = route.params?.mysterySetId as MysterySetId | undefined;
@@ -28,8 +152,6 @@ export default function PrayScreen({ route, navigation }: Props) {
   const {
     mysterySet,
     currentStep,
-    prayerTitle,
-    prayerText,
     currentIndex,
     totalSteps,
     progress,
@@ -43,368 +165,362 @@ export default function PrayScreen({ route, navigation }: Props) {
   const [showOverlay, setShowOverlay] = useState(false);
   const [toastText, setToastText] = useState('');
   const [showToast, setShowToast] = useState(false);
+  const [playerReady, setPlayerReady] = useState(false);
 
   const fadeAnim = useRef(new Animated.Value(1)).current;
+  const glowAnim = useRef(new Animated.Value(0)).current;
   const toastAnim = useRef(new Animated.Value(0)).current;
-  const gloryGlow = useRef(new Animated.Value(0)).current;
 
-  // Mostrar overlay de misterio
+  // ── Setup TrackPlayer ──────────────────────────────────────────────────────
   useEffect(() => {
-    if (currentStep.type === 'mystery_announce') {
-      setShowOverlay(true);
-    }
+    setupTrackPlayer().then(() => setPlayerReady(true));
+    return () => { teardownTrackPlayer(); };
+  }, []);
+
+  // ── Escuchar botones de volumen / auricular / pantalla bloqueada ───────────
+  useTrackPlayerEvents(
+    [TPEvent.RemoteNext, TPEvent.RemotePrevious],
+    useCallback(
+      (event) => {
+        if (event.type === TPEvent.RemoteNext) handleAdvance();
+        else if (event.type === TPEvent.RemotePrevious) handleGoBack();
+      },
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [currentIndex],
+    ),
+  );
+
+  // ── Mostrar overlay de misterio ───────────────────────────────────────────
+  useEffect(() => {
+    if (currentStep.type === 'mystery_announce') setShowOverlay(true);
   }, [currentStep]);
 
-  // Haptic + animación en Gloria
+  // ── Actualizar pantalla bloqueada en cada paso ────────────────────────────
   useEffect(() => {
-    if (decadeComplete) {
-      if (Platform.OS !== 'web') {
-        Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-        setTimeout(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium), 300);
-      }
-      Animated.sequence([
-        Animated.timing(gloryGlow, { toValue: 1, duration: 400, useNativeDriver: true }),
-        Animated.timing(gloryGlow, { toValue: 0, duration: 800, useNativeDriver: true }),
-      ]).start();
-      if (currentStep.decade !== undefined) {
-        showToastMessage(`${currentStep.decade}º decenio completado ✓`);
-      }
-    }
-  }, [decadeComplete, currentStep.decade]);
+    if (!playerReady) return;
+    const { title, artist } = getLockScreenLines(
+      currentStep,
+      mysterySet,
+      currentIndex,
+      totalSteps,
+    );
+    updateLockScreen(title, artist);
+  }, [currentIndex, playerReady]);
 
-  // Haptic suave en avanzar
-  function onAdvance() {
+  // ── Gloria: haptic + animación + toast ───────────────────────────────────
+  useEffect(() => {
+    if (!decadeComplete) return;
     if (Platform.OS !== 'web') {
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+      setTimeout(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium), 350);
+      setTimeout(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light), 650);
     }
-    // Animación de fade al cambiar oración
     Animated.sequence([
-      Animated.timing(fadeAnim, { toValue: 0.3, duration: 80, useNativeDriver: true }),
-      Animated.timing(fadeAnim, { toValue: 1, duration: 200, useNativeDriver: true }),
+      Animated.timing(glowAnim, { toValue: 1, duration: 300, useNativeDriver: true }),
+      Animated.timing(glowAnim, { toValue: 0, duration: 600, useNativeDriver: true }),
+      Animated.timing(glowAnim, { toValue: 1, duration: 250, useNativeDriver: true }),
+      Animated.timing(glowAnim, { toValue: 0, duration: 500, useNativeDriver: true }),
     ]).start();
+    if (currentStep.decade !== undefined) {
+      showToastMsg(`${currentStep.decade}° decenio ✓`);
+    }
+  }, [decadeComplete]);
 
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  const triggerFade = () => {
+    Animated.sequence([
+      Animated.timing(fadeAnim, { toValue: 0.2, duration: 70, useNativeDriver: true }),
+      Animated.timing(fadeAnim, { toValue: 1, duration: 180, useNativeDriver: true }),
+    ]).start();
+  };
+
+  const handleAdvance = useCallback(() => {
+    if (Platform.OS !== 'web') Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    triggerFade();
     if (currentIndex >= totalSteps - 1) {
-      navigation.replace('Completed', {
-        mysterySetName: mysterySet.name,
-      });
+      navigation.replace('Completed', { mysterySetName: mysterySet.name });
     } else {
       advance();
     }
-  }
+  }, [currentIndex, totalSteps]);
 
-  function onBack() {
-    if (Platform.OS !== 'web') {
-      Haptics.selectionAsync();
-    }
-    Animated.sequence([
-      Animated.timing(fadeAnim, { toValue: 0.3, duration: 80, useNativeDriver: true }),
-      Animated.timing(fadeAnim, { toValue: 1, duration: 200, useNativeDriver: true }),
-    ]).start();
+  const handleGoBack = useCallback(() => {
+    if (Platform.OS !== 'web') Haptics.selectionAsync();
+    triggerFade();
     goBack();
-  }
+  }, []);
 
-  function showToastMessage(msg: string) {
+  function showToastMsg(msg: string) {
     setToastText(msg);
     setShowToast(true);
     toastAnim.setValue(0);
     Animated.sequence([
-      Animated.timing(toastAnim, { toValue: 1, duration: 300, useNativeDriver: true }),
-      Animated.delay(1800),
-      Animated.timing(toastAnim, { toValue: 0, duration: 400, useNativeDriver: true }),
+      Animated.timing(toastAnim, { toValue: 1, duration: 250, useNativeDriver: true }),
+      Animated.delay(1600),
+      Animated.timing(toastAnim, { toValue: 0, duration: 350, useNativeDriver: true }),
     ]).start(() => setShowToast(false));
   }
 
-  const gradientColors = COLORS.bg[mysterySet.id] as [string, string];
-  const stepLabel = `${currentIndex + 1} / ${totalSteps}`;
-  const isMysteryAnnounce = currentStep.type === 'mystery_announce';
+  // ── Render ────────────────────────────────────────────────────────────────
+  const gradColors = COLORS.bg[mysterySet.id] as [string, string];
   const mystery =
-    currentStep.decade !== undefined
-      ? mysterySet.mysteries[currentStep.decade - 1]
-      : null;
+    decadeIndex >= 0 ? mysterySet.mysteries[decadeIndex] : null;
+  const mysteryTitle = mystery ? `${mystery.number}° · ${mystery.title}` : '';
 
   const showBeads =
-    currentStep.type === 'hail_mary' ||
-    currentStep.type === 'glory_be' ||
-    currentStep.type === 'fatima' ||
-    currentStep.type === 'our_father';
+    (currentStep.type === 'hail_mary' ||
+      currentStep.type === 'glory_be' ||
+      currentStep.type === 'fatima' ||
+      currentStep.type === 'our_father') &&
+    currentStep.decade !== undefined;
 
   return (
-    <LinearGradient colors={gradientColors} style={styles.flex}>
-      <SafeAreaView style={styles.flex}>
+    <LinearGradient colors={gradColors} style={s.flex}>
+      <SafeAreaView style={s.flex}>
 
-        {/* Barra superior */}
-        <View style={styles.topBar}>
-          <TouchableOpacity onPress={() => navigation.goBack()} style={styles.closeBtn}>
-            <Text style={styles.closeBtnText}>✕</Text>
+        {/* ── Barra superior ── */}
+        <View style={s.topBar}>
+          <TouchableOpacity onPress={() => navigation.goBack()} style={s.closeBtn}>
+            <Text style={s.closeTxt}>✕</Text>
           </TouchableOpacity>
-          <View style={styles.progressBarContainer}>
-            <View style={[styles.progressBarFill, { width: `${progress * 100}%` }]} />
+          <View style={s.progTrack}>
+            <View style={[s.progFill, { width: `${progress * 100}%` }]} />
           </View>
-          <Text style={styles.stepLabel}>{stepLabel}</Text>
+          <Text style={s.stepTxt}>{currentIndex + 1}/{totalSteps}</Text>
         </View>
 
-        {/* Misterio activo (si aplica) */}
-        {decadeIndex >= 0 && mystery && (
-          <View style={styles.mysteryBadge}>
-            <Text style={styles.mysteryBadgeText}>
-              {mysterySet.emoji}  {mystery.number}. {mystery.title}
+        {/* ── Badge de misterio ── */}
+        {mystery && (
+          <View style={s.badge}>
+            <Text style={s.badgeTxt} numberOfLines={1}>
+              {mysterySet.emoji}  {mysterySet.name}  ·  {mystery.number}°
             </Text>
           </View>
         )}
 
-        {/* Zona táctil izquierda (retroceder) */}
-        <TouchableOpacity
-          style={styles.tapZoneLeft}
-          onPress={onBack}
-          activeOpacity={0.6}
-        />
+        {/* ── Zonas táctiles laterales (todo el alto de la pantalla) ── */}
+        <TouchableOpacity style={s.tapLeft} onPress={handleGoBack} activeOpacity={1} />
+        <TouchableOpacity style={s.tapRight} onPress={handleAdvance} activeOpacity={1} />
 
-        {/* Zona táctil derecha (avanzar) */}
-        <TouchableOpacity
-          style={styles.tapZoneRight}
-          onPress={onAdvance}
-          activeOpacity={0.6}
-        />
-
-        {/* Glória glow */}
+        {/* ── Glow dorado en Gloria ── */}
         <Animated.View
-          style={[
-            styles.gloryGlow,
-            {
-              opacity: gloryGlow,
-              transform: [{ scale: gloryGlow.interpolate({ inputRange: [0, 1], outputRange: [0.8, 1.1] }) }],
-            },
-          ]}
+          style={[s.gloryGlow, { opacity: glowAnim }]}
           pointerEvents="none"
         />
 
-        {/* Tarjeta de oración */}
-        <View style={styles.prayerContainer}>
-          <Animated.View style={[styles.prayerCard, { opacity: fadeAnim }]}>
-            <Text style={styles.prayerTitle}>{prayerTitle}</Text>
-            <View style={styles.prayerDivider} />
-            <ScrollView
-              showsVerticalScrollIndicator={false}
-              contentContainerStyle={styles.prayerScrollContent}
-            >
-              <Text style={styles.prayerText}>{prayerText}</Text>
-            </ScrollView>
-          </Animated.View>
-        </View>
+        {/* ── Contenido heroico central ── */}
+        <Animated.View style={[s.heroWrap, { opacity: fadeAnim }]}>
+          <StepHero
+            step={currentStep}
+            mysteryTitle={mysteryTitle}
+            glowAnim={glowAnim}
+          />
+        </Animated.View>
 
-        {/* Cuentas del decenio */}
+        {/* ── Cuentas del decenio ── */}
         {showBeads && (
-          <View style={styles.beadsRow}>
+          <View style={s.beadsWrap}>
             <BeadProgress
               completed={beadInDecade}
               isGloryMoment={decadeComplete}
             />
-            {currentStep.type === 'hail_mary' && currentStep.beadInDecade !== undefined && (
-              <Text style={styles.beadCount}>
-                {currentStep.beadInDecade} / 10
-              </Text>
-            )}
           </View>
         )}
 
-        {/* Indicadores de tap */}
-        <View style={styles.tapHints} pointerEvents="none">
-          <Text style={styles.tapHintText}>‹ atrás</Text>
-          <Text style={styles.tapHintText}>siguiente ›</Text>
+        {/* ── Hints de tap ── */}
+        <View style={s.hints} pointerEvents="none">
+          <Text style={s.hintTxt}>‹</Text>
+          <Text style={s.hintTxt}>›</Text>
         </View>
 
       </SafeAreaView>
 
-      {/* Overlay de misterio */}
+      {/* ── Overlay de misterio ── */}
       {showOverlay && mystery && (
         <MysteryOverlay
           visible={showOverlay}
           mystery={mystery}
           mysterySet={mysterySet}
-          onContinue={() => {
-            setShowOverlay(false);
-            advance();
-          }}
+          onContinue={() => { setShowOverlay(false); advance(); }}
         />
       )}
 
-      {/* Toast */}
+      {/* ── Toast de decenio completo ── */}
       {showToast && (
-        <Animated.View style={[styles.toast, { opacity: toastAnim }]}>
-          <Text style={styles.toastText}>{toastText}</Text>
+        <Animated.View style={[s.toast, { opacity: toastAnim }]}>
+          <Text style={s.toastTxt}>{toastText}</Text>
         </Animated.View>
       )}
     </LinearGradient>
   );
 }
 
-const styles = StyleSheet.create({
+// ─── Estilos hero ──────────────────────────────────────────────────────────────
+const hero = StyleSheet.create({
+  container: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+  },
+  label: {
+    fontFamily: FONTS.sans,
+    fontSize: SIZES.md,
+    color: COLORS.muted,
+    letterSpacing: 2,
+    textTransform: 'uppercase',
+  },
+  countRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 4,
+  },
+  countBig: {
+    fontFamily: FONTS.serif,
+    fontSize: 110,
+    color: COLORS.white,
+    lineHeight: 120,
+    includeFontPadding: false,
+  },
+  countSep: {
+    fontFamily: FONTS.sans,
+    fontSize: SIZES.xl,
+    color: COLORS.muted,
+    marginBottom: 18,
+  },
+  countTotal: {
+    fontFamily: FONTS.serif,
+    fontSize: 52,
+    color: COLORS.muted,
+    lineHeight: 66,
+    includeFontPadding: false,
+  },
+  sub: {
+    fontFamily: FONTS.sans,
+    fontSize: SIZES.sm,
+    color: COLORS.gold,
+    letterSpacing: 0.5,
+    textAlign: 'center',
+    paddingHorizontal: 24,
+  },
+  prayerName: {
+    fontFamily: FONTS.serif,
+    fontSize: 52,
+    color: COLORS.white,
+    textAlign: 'center',
+    lineHeight: 62,
+    letterSpacing: 0.5,
+  },
+  gloryText: {
+    fontFamily: FONTS.serif,
+    fontSize: 72,
+    color: COLORS.gold,
+    textAlign: 'center',
+    shadowColor: COLORS.gold,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.8,
+    shadowRadius: 24,
+  },
+  gloryDecade: {
+    fontFamily: FONTS.sans,
+    fontSize: SIZES.md,
+    color: COLORS.goldLight,
+    letterSpacing: 0.5,
+  },
+  symbol: {
+    fontFamily: FONTS.serif,
+    fontSize: 72,
+    color: COLORS.pearl,
+  },
+});
+
+// ─── Estilos pantalla ─────────────────────────────────────────────────────────
+const s = StyleSheet.create({
   flex: { flex: 1 },
   topBar: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: 16,
-    paddingVertical: 10,
+    paddingTop: 8,
+    paddingBottom: 6,
     gap: 10,
   },
-  closeBtn: {
-    width: 32,
-    height: 32,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  closeBtnText: {
-    fontFamily: FONTS.sans,
-    fontSize: SIZES.lg,
-    color: 'rgba(255,255,255,0.5)',
-  },
-  progressBarContainer: {
+  closeBtn: { width: 32, height: 32, alignItems: 'center', justifyContent: 'center' },
+  closeTxt: { fontFamily: FONTS.sans, fontSize: SIZES.lg, color: COLORS.faint },
+  progTrack: {
     flex: 1,
-    height: 3,
-    backgroundColor: 'rgba(255,255,255,0.12)',
-    borderRadius: 2,
+    height: 2,
+    backgroundColor: 'rgba(255,255,255,0.1)',
+    borderRadius: 1,
     overflow: 'hidden',
   },
-  progressBarFill: {
-    height: '100%',
-    backgroundColor: COLORS.gold,
-    borderRadius: 2,
-  },
-  stepLabel: {
-    fontFamily: FONTS.sans,
-    fontSize: SIZES.xs,
-    color: COLORS.muted,
-    minWidth: 44,
-    textAlign: 'right',
-  },
-  mysteryBadge: {
-    marginHorizontal: 20,
-    marginBottom: 6,
+  progFill: { height: '100%', backgroundColor: COLORS.gold, borderRadius: 1 },
+  stepTxt: { fontFamily: FONTS.sans, fontSize: SIZES.xs, color: COLORS.faint, minWidth: 40, textAlign: 'right' },
+  badge: {
+    alignSelf: 'center',
     backgroundColor: COLORS.card,
     borderWidth: 1,
     borderColor: COLORS.cardBorder,
     borderRadius: RADIUS.full,
-    paddingVertical: 6,
+    paddingVertical: 5,
     paddingHorizontal: 14,
-    alignSelf: 'center',
+    marginBottom: 8,
   },
-  mysteryBadgeText: {
-    fontFamily: FONTS.sans,
-    fontSize: SIZES.xs,
-    color: COLORS.gold,
-    letterSpacing: 0.3,
-  },
-  // Zonas táctiles laterales (invisibles)
-  tapZoneLeft: {
+  badgeTxt: { fontFamily: FONTS.sans, fontSize: SIZES.xs, color: COLORS.gold, letterSpacing: 0.3 },
+  // Zonas táctiles — cubre todo el alto menos top/bottom bar
+  tapLeft: {
     position: 'absolute',
-    left: 0,
-    top: 120,
-    bottom: 120,
-    width: '40%',
+    left: 0, top: 80, bottom: 80,
+    width: '42%',
     zIndex: 10,
   },
-  tapZoneRight: {
+  tapRight: {
     position: 'absolute',
-    right: 0,
-    top: 120,
-    bottom: 120,
-    width: '40%',
+    right: 0, top: 80, bottom: 80,
+    width: '42%',
     zIndex: 10,
   },
-  // Glow para el Gloria
+  // Gloria glow
   gloryGlow: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(212,175,55,0.08)',
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(212,175,55,0.10)',
     zIndex: 0,
   },
-  // Tarjeta de oración
-  prayerContainer: {
+  // Hero
+  heroWrap: {
     flex: 1,
-    paddingHorizontal: 20,
-    paddingBottom: 10,
+    alignItems: 'center',
     justifyContent: 'center',
-  },
-  prayerCard: {
-    backgroundColor: COLORS.card,
-    borderWidth: 1,
-    borderColor: COLORS.cardBorder,
-    borderRadius: RADIUS.lg,
-    padding: 28,
-    maxHeight: '80%',
-  },
-  prayerTitle: {
-    fontFamily: FONTS.serif,
-    fontSize: SIZES.xl,
-    color: COLORS.gold,
-    textAlign: 'center',
-    marginBottom: 14,
-    letterSpacing: 0.3,
-  },
-  prayerDivider: {
-    height: 1,
-    backgroundColor: COLORS.cardBorder,
-    marginBottom: 18,
-  },
-  prayerScrollContent: {
-    paddingBottom: 4,
-  },
-  prayerText: {
-    fontFamily: FONTS.serif,
-    fontSize: SIZES.lg,
-    color: COLORS.pearl,
-    textAlign: 'center',
-    lineHeight: 30,
-    letterSpacing: 0.2,
+    zIndex: 5,
+    paddingHorizontal: 24,
   },
   // Cuentas
-  beadsRow: {
-    paddingBottom: 12,
-    paddingTop: 4,
-    alignItems: 'center',
-    gap: 6,
+  beadsWrap: {
+    paddingBottom: 10,
+    zIndex: 5,
   },
-  beadCount: {
-    fontFamily: FONTS.sansBold,
-    fontSize: SIZES.sm,
-    color: COLORS.gold,
-    opacity: 0.85,
-  },
-  // Hints de tap
-  tapHints: {
+  // Hints
+  hints: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    paddingHorizontal: 24,
+    paddingHorizontal: 28,
     paddingBottom: 12,
+    zIndex: 5,
   },
-  tapHintText: {
+  hintTxt: {
     fontFamily: FONTS.sans,
-    fontSize: SIZES.xs,
-    color: COLORS.faint,
-    letterSpacing: 0.5,
+    fontSize: 22,
+    color: 'rgba(255,255,255,0.18)',
   },
   // Toast
   toast: {
     position: 'absolute',
-    bottom: 100,
+    bottom: 90,
     alignSelf: 'center',
-    backgroundColor: 'rgba(212,175,55,0.92)',
+    backgroundColor: 'rgba(212,175,55,0.95)',
     borderRadius: RADIUS.full,
-    paddingVertical: 10,
-    paddingHorizontal: 22,
-    shadowColor: COLORS.gold,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.4,
-    shadowRadius: 10,
-    elevation: 8,
+    paddingVertical: 9,
+    paddingHorizontal: 20,
+    zIndex: 20,
   },
-  toastText: {
-    fontFamily: FONTS.sansBold,
-    fontSize: SIZES.sm,
-    color: '#1a0a00',
-    letterSpacing: 0.3,
-  },
+  toastTxt: { fontFamily: FONTS.sansBold, fontSize: SIZES.sm, color: '#1a0a00' },
 });

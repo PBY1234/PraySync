@@ -19,6 +19,7 @@
       "bundleIdentifier": "energy.aukera.praysync",
       "infoPlist": {
         "UIBackgroundModes": [
+          "audio",
           "fetch",
           "remote-notification"
         ]

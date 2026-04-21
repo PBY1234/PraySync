@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { StatusBar } from 'expo-status-bar';
@@ -10,7 +10,7 @@ import {
 } from '@expo-google-fonts/playfair-display';
 import { Lato_400Regular, Lato_700Bold } from '@expo-google-fonts/lato';
 import * as SplashScreen from 'expo-splash-screen';
-import { useEffect } from 'react';
+import TrackPlayer from 'react-native-track-player';
 
 import HomeScreen from './src/screens/HomeScreen';
 import PrayScreen from './src/screens/PrayScreen';
@@ -18,6 +18,11 @@ import CompletedScreen from './src/screens/CompletedScreen';
 import type { MysterySetId } from './src/constants/rosary';
 
 SplashScreen.preventAutoHideAsync();
+
+// Registrar el servicio de audio en segundo plano (requerido por react-native-track-player)
+TrackPlayer.registerPlaybackService(
+  () => require('./src/services/playbackService'),
+);
 
 export type RootStackParamList = {
   Home: undefined;
@@ -35,9 +40,7 @@ export default function App() {
   });
 
   useEffect(() => {
-    if (fontsLoaded || fontError) {
-      SplashScreen.hideAsync();
-    }
+    if (fontsLoaded || fontError) SplashScreen.hideAsync();
   }, [fontsLoaded, fontError]);
 
   if (!fontsLoaded && !fontError) return null;
