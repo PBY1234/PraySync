@@ -19,10 +19,12 @@ import type { MysterySetId } from './src/constants/rosary';
 
 SplashScreen.preventAutoHideAsync();
 
-// Registrar el servicio de audio en segundo plano (requerido por react-native-track-player)
-TrackPlayer.registerPlaybackService(
-  () => require('./src/services/playbackService'),
-);
+// En Expo Go el módulo nativo no está disponible — se ignora silenciosamente
+try {
+  TrackPlayer.registerPlaybackService(
+    () => require('./src/services/playbackService'),
+  );
+} catch {}
 
 export type RootStackParamList = {
   Home: undefined;

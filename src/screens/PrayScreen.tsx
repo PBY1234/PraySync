@@ -10,10 +10,7 @@ import {
 import { LinearGradient } from 'expo-linear-gradient';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
-import {
-  useTrackPlayerEvents,
-  Event as TPEvent,
-} from 'react-native-track-player';
+import TrackPlayer, { Event as TPEvent } from 'react-native-track-player';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
 
 import { useRosary } from '../hooks/useRosary';
@@ -178,17 +175,19 @@ export default function PrayScreen({ route, navigation }: Props) {
   }, []);
 
   // ── Escuchar botones de volumen / auricular / pantalla bloqueada ───────────
-  useTrackPlayerEvents(
-    [TPEvent.RemoteNext, TPEvent.RemotePrevious],
-    useCallback(
-      (event) => {
-        if (event.type === TPEvent.RemoteNext) handleAdvance();
-        else if (event.type === TPEvent.RemotePrevious) handleGoBack();
-      },
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-      [currentIndex],
-    ),
-  );
+  // Usa addEventListener directo para que funcione también en Expo Go (try/catch)
+  useEffect(() => {
+    let subNext: { remove: () => void } | undefined;
+    let subPrev: { remove: () => void } | undefined;
+    try {
+      subNext = TrackPlayer.addEventListener(TPEvent.RemoteNext, handleAdvance);
+      subPrev = TrackPlayer.addEventListener(TPEvent.RemotePrevious, handleGoBack);
+    } catch {}
+    return () => {
+      try { subNext?.remove(); subPrev?.remove(); } catch {}
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentIndex]);
 
   // ── Mostrar overlay de misterio ───────────────────────────────────────────
   useEffect(() => {
